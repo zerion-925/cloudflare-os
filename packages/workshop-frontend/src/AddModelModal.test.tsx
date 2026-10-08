@@ -12,7 +12,11 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => ({
   useKumoToastManager: () => ({ add: vi.fn<(toast: unknown) => void>() }),
 }))
 
+const providerState = vi.hoisted(() => ({ api: {} }))
+vi.mock('./AuthContext', () => ({ useAuthenticatedApi: () => ({ authenticatedApi: providerState.api }) }))
+
 import AddModelModal, { type ModelModalMode } from './AddModelModal'
+import { Route as ProvidersRoute } from './routes/providers'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -75,10 +79,39 @@ describe('AddModelModal with a stored model', () => {
       onCancel={() => {}}
       onSuccess={() => {}}
       authenticatedApi={api}
-      aiConfig={{ enabled: false }}
+      aiConfig={{ enabled: false, managedModelIds: [] }}
     />))
     return { updateModel, addModel }
   }
+
+  it('offers managed selection without editor, clone, delete or credential loading', async () => {
+    const managed = { type: 'agent' as const, id: 'managed:cliproxy:gpt-5.5', name: 'CLIProxy GPT-5.5' }
+    const getModelConfig = vi.fn<AuthenticatedApi['getModelConfig']>()
+    const setQuickModel = vi.fn<AuthenticatedApi['setQuickModel']>(async () => {})
+    providerState.api = {
+      listModels: async () => [managed], getQuickModel: async () => null,
+      getAiConfig: async () => ({ enabled: false, managedModelIds: [managed.id] }),
+      getModelConfig, setQuickModel,
+    }
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    const ProvidersPage = ProvidersRoute.options.component!
+    await ProvidersPage.preload?.()
+    await act(async () => root!.render(<ProvidersPage />))
+    expect(document.body.textContent).toContain('Deployment-managed')
+    expect(document.body.textContent).not.toContain('AI Gateway mode:')
+    expect(document.body.textContent).toContain('none set.')
+    expect(setQuickModel).not.toHaveBeenCalled()
+    const row = container.querySelector<HTMLElement>('[role="button"]')!
+    await click(row)
+    expect(setQuickModel).toHaveBeenCalledWith(managed.id)
+    await click(button('Provider actions'))
+    expect(document.body.textContent).not.toContain('Edit provider')
+    expect(document.body.textContent).not.toContain('Clone provider')
+    expect(document.body.textContent).not.toContain('Delete provider')
+    expect(getModelConfig).not.toHaveBeenCalled()
+  })
 
   it('sends withheld secrets back as null when they are left untouched', async () => {
     const { updateModel } = await render({ type: 'edit', source: { profile: PROFILE, config: CONFIG } })

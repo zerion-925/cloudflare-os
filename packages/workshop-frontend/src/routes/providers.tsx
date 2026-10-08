@@ -5,8 +5,6 @@ import { useAuthenticatedApi } from '../AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
-  AiModelProvider,
-  SUGGESTED_MODELS,
 } from '@gadgets/workshop-shared/api'
 import {
   Plus,
@@ -24,8 +22,6 @@ import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuSty
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
 // ─── constants ────────────────────────────────────────────────────────────────
-
-const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
 const PRIMARY_BTN =
   'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
@@ -78,7 +74,7 @@ function ModelRow({
           </span>
           {isBuiltIn && (
             <span className="shrink-0 rounded-full bg-kumo-tint px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-subtle">
-              built-in
+              Deployment-managed
             </span>
           )}
           {isQuick && (
@@ -185,11 +181,8 @@ function ProvidersPage() {
 
   const gatewayMode = aiConfig?.enabled === true
 
-  const isBuiltIn = (modelId: string): boolean => {
-    if (!aiConfig?.enabled) return false
-    const enabled = new Set((aiConfig as Extract<AiGatewayInfo, { enabled: true }>).enabledProviders)
-    return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
-  }
+  const isBuiltIn = (modelId: string): boolean =>
+    aiConfig?.managedModelIds.includes(modelId) ?? false
 
   // Bumped whenever the user opens a dialog, so a configuration that finishes loading after a later
   // click doesn't open its editor over the dialog the user chose.
@@ -199,6 +192,7 @@ function ProvidersPage() {
     setSheetOpen(true)
   }
   const openWithSource = async (type: 'edit' | 'clone', model: AiChatAuthorInfo) => {
+    if (isBuiltIn(model.id)) return
     const request = ++openRequest.current
     try {
       const source = await authenticatedApi.getModelConfig(model.id)
@@ -211,6 +205,7 @@ function ProvidersPage() {
   }
 
   const handleDelete = async (model: AiChatAuthorInfo) => {
+    if (isBuiltIn(model.id)) return
     if (!confirm(`Delete "${model.name}"? This cannot be undone.`)) return
     setDeletingId(model.id)
     try {
@@ -291,6 +286,15 @@ function ProvidersPage() {
                   <strong className="font-medium text-kumo-default">AI Gateway mode:</strong> built-in
                   models are managed by your deployment. You can still add other models from the
                   enabled providers.
+                </span>
+              </Notice>
+            )}
+
+            {!gatewayMode && (aiConfig?.managedModelIds.length ?? 0) > 0 && (
+              <Notice>
+                <span>
+                  <strong className="font-medium text-kumo-default">Deployment-managed models:</strong>{' '}
+                  ready to use without a personal key. Connection settings are managed by your deployment.
                 </span>
               </Notice>
             )}

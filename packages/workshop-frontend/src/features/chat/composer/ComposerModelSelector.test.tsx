@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import { ComposerModelSelector, type SelectedModel } from "./ComposerModelSelector";
+import { getStoredSelectedModel, persistSelectedModel } from "../../../modelSelection";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -21,6 +22,7 @@ afterEach(() => {
   container?.remove();
   root = null;
   container = null;
+  localStorage.clear();
 });
 
 function renderTriggerLabel(selectedModel: SelectedModel): string {
@@ -38,6 +40,19 @@ function renderTriggerLabel(selectedModel: SelectedModel): string {
 }
 
 describe("ComposerModelSelector", () => {
+  it("defaults a fresh account to the managed model without replacing personal or No-agent selections", () => {
+    const managed: AiChatAuthorInfo = { type: "agent", id: "managed:cliproxy:gpt-5.5", name: "Shared" };
+    expect(getStoredSelectedModel([managed])).toBe(managed.id);
+    persistSelectedModel(models[0].id);
+    expect(getStoredSelectedModel([...models, managed])).toBe(models[0].id);
+    persistSelectedModel(managed.id);
+    expect(getStoredSelectedModel([...models, managed])).toBe(managed.id);
+    persistSelectedModel(null);
+    expect(getStoredSelectedModel([managed])).toBeNull();
+    persistSelectedModel(managed.id);
+    expect(getStoredSelectedModel([])).toBeNull();
+  });
+
   it("labels an offered model by its listed name", () => {
     expect(renderTriggerLabel({ id: "claude-opus-5-5", name: "Stale name" })).toBe("Claude Opus 5.5");
   });
