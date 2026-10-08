@@ -24,6 +24,11 @@ declare global {
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 
+      // Direct deployment-managed catalog (nonsecret JSON); omitted/[] disables it.
+      SHARED_AI_MODELS?: { model: string; name: string }[] | string;
+      // Workshop-only Worker secret. Never copied to User DOs or public configuration.
+      CLIPROXY_API_KEY?: string;
+
       // Blueprint storage bindings.
       BLUEPRINTS: KVNamespace;             // Workers KV for blueprint metadata lookup
       BLUEPRINT_CONTENT: R2Bucket;         // R2 bucket for blueprint code snapshots

@@ -1,10 +1,11 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SUGGESTED_MODELS, type AiChatAuthorInfo, type AiModelConfig,
 } from "@gadgets/workshop-shared/api";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
+import { resolveManagedModel } from "../src/ai-gateway.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
 // the returned handle's model descriptor (baseUrl/id/api) and log route, and request-level
@@ -674,6 +675,139 @@ describe("getModel direct routing (no gateway)", () => {
       }, INITIATOR);
       expect(handle.model.baseUrl).toBe("http://my-ollama:11434/v1");
     }
+  });
+});
+
+describe("deployment-managed direct Responses transport", () => {
+  const ID = "managed:cliproxy:gpt-5.5";
+  const KEY = "synthetic-shared-key";
+  const configured = () => env({
+    SHARED_AI_MODELS: [{ model: "gpt-5.5", name: "CLIProxy GPT-5.5" }], CLIPROXY_API_KEY: KEY,
+  });
+  const context = { messages: [{ role: "user" as const, content: "hello", timestamp: 0 }] };
+  const sse = (events: unknown[]) => new Response(
+    events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    { headers: { "Content-Type": "text/event-stream", "cf-aig-log-id": KEY } });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("reconstructs trusted routing and limits before both Gateways; ignores all connection/payload overrides", async () => {
+    const e = configured();
+    const config = resolveManagedModel(e, ID)!.config;
+    const handle = getModel(e, {
+      ...config, provider: "anthropic", model: "unapproved", apiUrl: "https://attacker.test",
+      apiToken: "user-key", extraHeaders: { Authorization: "user-auth", "X-Unsafe": "unsafe" },
+      contextWindow: 999999, outputLimit: 999999,
+    }, INITIATOR, { userGateway: { accountId: "unrelated", apiKey: "unrelated" } });
+    expect(handle.model).toMatchObject({
+      id: "gpt-5.5", api: "openai-responses", input: ["text"], contextWindow: 128000, maxTokens: 4096,
+    });
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+    const requests: Request[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json({ error: { message: `invalid credential ${KEY}` } }, { status: 401 });
+    }));
+    const bypass = vi.fn();
+    handle.model.baseUrl = "https://attacker.test";
+    handle.model.id = "forged";
+    const stream = handle.stream(handle.model, context, {
+      fetch: bypass, headers: { Authorization: "forged", "X-Unsafe": "unsafe" },
+      samplingParams: { model: "forged", max_output_tokens: 999999 }, onPayload: bypass,
+      onResponse: bypass, maxTokens: 999999, maxRetries: 0,
+    });
+    const events = [];
+    for await (const event of stream) events.push(event);
+    expect((await stream.result()).errorMessage).toBe("Deployment-managed AI request failed.");
+    expect(JSON.stringify(events)).not.toContain(KEY);
+    expect(bypass).not.toHaveBeenCalled();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe("https://proxy-api.buchan.cloud/v1/responses");
+    expect(requests[0].redirect).toBe("manual");
+    expect(requests[0].headers.get("authorization")).toBe(`Bearer ${KEY}`);
+    expect(requests[0].headers.get("x-unsafe")).toBeNull();
+    expect(requests[0].headers.get("cf-aig-authorization")).toBeNull();
+    expect(await requests[0].json()).toMatchObject({ model: "gpt-5.5", max_output_tokens: 4096, store: false });
+    expect(JSON.stringify(config)).not.toContain(KEY);
+  });
+
+  it("streams tool deltas and stateless continuation with encrypted reasoning", async () => {
+    const e = configured();
+    const handle = getModel(e, resolveManagedModel(e, ID)!.config, INITIATOR);
+    const call = { type: "function_call", id: "fc_one", call_id: "call_one", name: "lookup", arguments: '{"q":"hi"}' };
+    const reasoning = { type: "reasoning", id: "rs_one", summary: [], encrypted_content: "opaque-reasoning" };
+    const text = { type: "message", id: "msg_one", role: "assistant", content: [{ type: "output_text", text: "Done" }] };
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      bodies.push(await new Request(input, init).json());
+      return bodies.length === 1 ? sse([
+        { type: "response.output_item.done", output_index: 0, item: reasoning },
+        { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "" } },
+        { type: "response.function_call_arguments.delta", output_index: 1, delta: call.arguments },
+        { type: "response.output_item.done", output_index: 1, item: call },
+        { type: "response.completed", response: { status: "completed", output: [reasoning, call] } },
+      ]) : sse([
+        { type: "response.output_item.added", output_index: 0, item: { ...text, content: [] } },
+        { type: "response.output_text.delta", output_index: 0, delta: "Done" },
+        { type: "response.output_item.done", output_index: 0, item: text },
+        { type: "response.completed", response: { status: "completed", output: [text] } },
+      ]);
+    }));
+    const first = handle.stream(handle.model, context, { maxRetries: 0 });
+    const types: string[] = [];
+    for await (const event of first) types.push(event.type);
+    expect(types).toContain("toolcall_delta");
+    const result = await first.result();
+    expect(result.stopReason).toBe("toolUse");
+    const next = handle.stream(handle.model, { messages: [...context.messages, result, {
+      role: "toolResult", toolCallId: "call_one|fc_one", toolName: "lookup", isError: false,
+      content: [{ type: "text", text: "found" }], timestamp: 1,
+    }] }, { maxRetries: 0 });
+    const nextTypes: string[] = [];
+    for await (const event of next) nextTypes.push(event.type);
+    expect(nextTypes).toContain("text_delta");
+    expect((await next.result()).content).toContainEqual(expect.objectContaining({ text: "Done" }));
+    expect(bodies[1].input).toContainEqual(reasoning);
+    expect(bodies[1].input).toContainEqual(expect.objectContaining({ type: "function_call_output", call_id: "call_one", output: "found" }));
+    expect(JSON.stringify(bodies)).not.toContain(KEY);
+    expect(handle.lastResponse).toEqual({ status: 200, aiGatewayLogId: undefined });
+  });
+
+  it("sanitizes mid-stream and network errors, and refuses image/PDF input", async () => {
+    const e = configured();
+    const handle = getModel(e, resolveManagedModel(e, ID)!.config, INITIATOR);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(sse([
+      { type: "error", code: "auth", message: KEY },
+    ])).mockRejectedValueOnce(new Error(KEY)));
+    for (let i = 0; i < 2; i++) {
+      const result = await handle.stream(handle.model, context, { maxRetries: 0 }).result();
+      expect(result.stopReason).toBe("error");
+      expect(JSON.stringify(result)).not.toContain(KEY);
+    }
+    for (const mimeType of ["image/png", "application/pdf"]) {
+      expect(() => handle.stream(handle.model, { messages: [{ role: "user", timestamp: 0,
+        content: [{ type: "image", data: "fake", mimeType }],
+      }] })).toThrow("text and tools only");
+    }
+  });
+
+  it("fails closed on missing, disabled, malformed, unknown or removed configuration", async () => {
+    const e = configured();
+    const config = resolveManagedModel(e, ID)!.config;
+    for (const SHARED_AI_MODELS of [undefined, [], "invalid", [{ model: "unapproved", name: "x" }]]) {
+      expect(() => getModel({ ...e, SHARED_AI_MODELS }, config, INITIATOR)).toThrow("unavailable");
+    }
+    expect(() => getModel({ ...e, CLIPROXY_API_KEY: undefined }, config, INITIATOR)).toThrow("credential is unavailable");
+    for (const managedModelId of [undefined, "managed:cliproxy:unknown", "personal"]) {
+      expect(() => getModel(e, { ...config, managedModelId }, INITIATOR)).toThrow("unavailable");
+    }
+    expect(() => getModel(e, { provider: "openai", model: ID, apiToken: "fake" }, INITIATOR)).toThrow("unavailable");
+    const handle = getModel(e, config, INITIATOR);
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    e.SHARED_AI_MODELS = [];
+    expect((await handle.stream(handle.model, context, { maxRetries: 0 }).result()).stopReason).toBe("error");
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 

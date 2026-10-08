@@ -1286,12 +1286,18 @@ export type CloudflareAccountOption = {
 /** Supported AI providers. */
 export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
 
-/** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
-export type AiGatewayInfo = {
+/** Secret-free deployment AI metadata. Returned by `AuthenticatedApi.getAiConfig()`. */
+export type AiGatewayInfo = ({
+  /** Whether requests use the deployment's Cloudflare AI Gateway. */
   enabled: true;
+  /** Providers enabled on that Gateway. */
   enabledProviders: AiModelProvider[];
 } | {
+  /** Direct access; managed models do not imply Gateway mode. */
   enabled: false;
+}) & {
+  /** Read-only deployment model identities, independent of Gateway mode. */
+  managedModelIds: string[];
 };
 
 /** Configuration specifying how to connect to an AI model provider. */

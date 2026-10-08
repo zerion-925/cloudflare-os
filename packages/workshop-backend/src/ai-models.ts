@@ -4,7 +4,7 @@ import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, FetchFunction, Model,
   ModelCost, OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
 } from "@earendil-works/pi-ai";
-import { normalizeContext } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, normalizeContext } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
@@ -19,7 +19,10 @@ import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
   from "@gadgets/workshop-shared/api";
 import { traceChat } from "./agent-tracing.js";
-import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
+import {
+  AiGatewayConfig, getAiGatewayConfig, isManagedModelId, resolveManagedModel, SHARED_AI_BASE_URL,
+  type AiGatewayLogRoute, type ResolvedAiModelConfig,
+} from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 
@@ -277,7 +280,30 @@ type HandleArgs = {
   // gateway over env.WORKERS_AI.fetch() instead of the global fetch (see bindingFetch).
   // A per-call options.fetch still wins, which tests rely on to capture requests.
   fetch?: FetchFunction;
+  // Managed calls accept only bounded generation options, never routing/payload hooks.
+  managed?: boolean;
 };
+
+// Provider/SDK failures may echo credentials. Sanitize before tracing, persistence or callers
+// observe the final message, including errors received inside a successful SSE response.
+function sanitizedManagedStream(source: AssistantMessageEventStream): AssistantMessageEventStream {
+  const result = createAssistantMessageEventStream();
+  void (async () => {
+    for await (const event of source) {
+      if (event.type === "error") {
+        event.error.errorMessage = "Deployment-managed AI request failed.";
+        event.error.content = [];
+        delete event.error.responseId;
+        delete event.error.responseModel;
+        delete event.error.rawStopReason;
+        delete event.error.diagnostics;
+      }
+      result.push(event);
+    }
+    result.end();
+  })();
+  return result;
+}
 
 function makeHandle(args: HandleArgs): ModelHandle {
   const streamFn = API_STREAMS[args.model.api];
@@ -302,10 +328,26 @@ function makeHandle(args: HandleArgs): ModelHandle {
           ? (anthropicCompat?.forceAdaptiveThinking === true ? { thinkingEnabled: true } : {}) :
       args.model.api === "openai-responses" ? { reasoningEffort: "medium" } : {};
 
+  // Keep the managed descriptor private: mutating handle.model must not change its destination.
+  const canonicalModel = args.managed ? structuredClone(args.model) : undefined;
   const handle: ModelHandle = {
     model: args.model,
     aiGatewayLogRoute: args.aiGatewayLogRoute,
     stream: (model, context, { thinking = true, ...options } = {}) => {
+      if (canonicalModel) {
+        if (context.messages.some(message => Array.isArray(message.content) &&
+            message.content.some(part => part.type === "image"))) {
+          throw new Error("Deployment-managed AI supports text and tools only, not images or PDFs.");
+        }
+        model = structuredClone(canonicalModel);
+        // No arbitrary headers, fetch, env, samplingParams or onPayload/onResponse callbacks.
+        options = {
+          signal: options.signal, timeoutMs: options.timeoutMs, maxRetries: options.maxRetries,
+          maxRetryDelayMs: options.maxRetryDelayMs, toolChoice: options.toolChoice,
+          maxTokens: Number.isSafeInteger(options.maxTokens) && options.maxTokens! > 0
+              ? Math.min(options.maxTokens!, model.maxTokens) : model.maxTokens,
+        };
+      }
       // Never let a failed request read a previous request's response metadata.
       handle.lastResponse = undefined;
       // This request's own response metadata: concurrent requests on one handle overwrite
@@ -351,22 +393,76 @@ function makeHandle(args: HandleArgs): ModelHandle {
           return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
       };
-      return traceChat(model, () => received,
-          () => streamFn(model, normalizeContext(context), merged));
+      return traceChat(model, () => received, () => {
+        const stream = streamFn(model, normalizeContext(context), merged);
+        return args.managed ? sanitizedManagedStream(stream) : stream;
+      });
     },
   };
   return handle;
 }
 
 /**
- * Resolve an AiModelConfig to a ModelHandle, choosing among three routing modes: the user's own
- * AI Gateway (BYOK unified billing), the platform's AI Gateway (free tier), or direct provider
- * access with the config's own credentials. The handle carries the matching AI Gateway log route
+ * Resolve a backend config/reference to a ModelHandle. Managed references are reconstructed
+ * from deployment data first; personal configs retain user Gateway, platform Gateway, then
+ * direct-provider precedence. The handle carries the matching AI Gateway log route
  * for cost accounting, when there is one.
  */
-export function getModel(env: Cloudflare.Env, config: AiModelConfig,
+export function getModel(env: Cloudflare.Env, config: ResolvedAiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
+  // Resolve BEFORE either Gateway branch. A managed reference is not user-Gateway billing.
+  if ("managedModelId" in config || isManagedModelId(config.model)) {
+    const id = config.managedModelId;
+    const managed = typeof id === "string" ? resolveManagedModel(env, id) : undefined;
+    if (!managed) throw new Error("Deployment-managed model is unavailable.");
+    if (!env.CLIPROXY_API_KEY?.trim()) {
+      throw new Error("Deployment-managed AI credential is unavailable.");
+    }
+    const trusted = managed.config;
+    return makeHandle({
+      model: {
+        id: trusted.model, name: managed.profile.name, api: "openai-responses", provider: "openai",
+        baseUrl: SHARED_AI_BASE_URL, reasoning: true, input: ["text"], cost: ZERO_COST,
+        contextWindow: trusted.contextWindow!, maxTokens: trusted.outputLimit!,
+      },
+      // The real credential exists only inside the transport, not in SDK options or a descriptor.
+      apiKey: "deployment-managed",
+      managed: true,
+      fetch: async (input, init) => {
+        // Also recheck retained handles, so removal cannot fall back to a stored connection.
+        if (!resolveManagedModel(env, id!) || !env.CLIPROXY_API_KEY?.trim()) {
+          throw new Error("Deployment-managed model or credential is unavailable.");
+        }
+        const request = new Request(input, init);
+        if (request.url !== `${SHARED_AI_BASE_URL}/responses` || request.method !== "POST") {
+          throw new Error("Deployment-managed AI route is unavailable.");
+        }
+        try {
+          const response = await fetch(request.url, {
+            // workerd supports manual/follow, not the standard fetch "error" redirect mode.
+            method: "POST", body: request.body, signal: request.signal, redirect: "manual",
+            headers: {
+              "Content-Type": "application/json", Accept: "text/event-stream",
+              Authorization: `Bearer ${env.CLIPROXY_API_KEY}`,
+            },
+          });
+          if (!response.ok) {
+            await response.body?.cancel();
+            // No response body, headers or statusText: any may echo the request credential.
+            return new Response(null, { status: response.status });
+          }
+          // Do not expose upstream headers (including potential credential echoes) to callbacks
+          // or trace/log IDs. The only supported response is the Responses SSE stream.
+          return new Response(response.body, {
+            status: response.status, headers: { "Content-Type": "text/event-stream" },
+          });
+        } catch {
+          throw new Error("Deployment-managed AI transport failed.");
+        }
+      },
+    });
+  }
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
@@ -671,7 +767,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
 
 export type LanguageModelGatekeeperProps = {
   displayName: string,
-  config: AiModelConfig,
+  config: ResolvedAiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
 };

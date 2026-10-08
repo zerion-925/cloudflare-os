@@ -1,7 +1,50 @@
 import {
   AiChatAuthorInfo, AiModelConfig, HTTPS_ONLY_PROVIDERS, SUGGESTED_MODELS,
 } from "@gadgets/workshop-shared/api";
-import { UserAiModelRecord } from "./user.js";
+import type { UserAiModelRecord } from "./user.js";
+
+/** Backend-only routing reference. Never accepted as personal provider configuration. */
+export type ResolvedAiModelConfig = AiModelConfig & { managedModelId?: string };
+
+/** Reserved even while the deployment catalog is disabled. */
+export function isManagedModelId(id: string): boolean {
+  return id.startsWith("managed:");
+}
+
+/** Fixed direct destination; neither users nor deployment input may override it. */
+export const SHARED_AI_BASE_URL = "https://proxy-api.buchan.cloud/v1";
+
+/** Secret-free deployment catalog. Unknown configuration fails closed, without echoing input. */
+export function getManagedModels(env: Cloudflare.Env): UserAiModelRecord[] {
+  let models: unknown = env.SHARED_AI_MODELS ?? [];
+  if (typeof models === "string") {
+    try { models = JSON.parse(models); } catch {
+      throw new Error("Deployment-managed AI configuration is unavailable.");
+    }
+  }
+  if (!Array.isArray(models) || models.length > 1 || models.some(model =>
+      !model || typeof model !== "object" || model.model !== "gpt-5.5" ||
+      typeof model.name !== "string" || !model.name.trim() || model.name.length > 100 ||
+      Object.keys(model).some(key => key !== "model" && key !== "name"))) {
+    throw new Error("Deployment-managed AI configuration is unavailable.");
+  }
+  return models.map(({ model, name }) => {
+    const id = `managed:cliproxy:${model}`;
+    return {
+      profile: { type: "agent", id, name },
+      config: {
+        managedModelId: id, provider: "openai", model, apiToken: "",
+        // Conservative text/tool-only support, not the provider's advertised full capacity.
+        contextWindow: 128_000, outputLimit: 4096,
+      },
+    };
+  });
+}
+
+/** Resolve only an enabled canonical entry; never consult a personal provider as fallback. */
+export function resolveManagedModel(env: Cloudflare.Env, id: string): UserAiModelRecord | undefined {
+  return getManagedModels(env).find(model => model.profile.id === id);
+}
 
 // The model used for quick tasks like title generation when AI Gateway mode is active.
 //

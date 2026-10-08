@@ -16,7 +16,7 @@ import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from 
 export { PendingLogin, LoginConnectCallbackImpl };
 import { GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
-import { getAiGatewayConfig } from "./ai-gateway.js";
+import { getAiGatewayConfig, getManagedModels } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintContent, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
@@ -235,13 +235,17 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   getAiConfig(): Promise<AiGatewayInfo> {
     let gwConfig = getAiGatewayConfig(this.env);
+    const managedModelIds = [
+      ...(gwConfig?.getModelList() ?? []), ...getManagedModels(this.env).map(model => model.profile),
+    ].map(model => model.id);
     if (gwConfig) {
       return Promise.resolve({
         enabled: true,
         enabledProviders: [...gwConfig.providers] as AiModelProvider[],
+        managedModelIds,
       });
     } else {
-      return Promise.resolve({ enabled: false });
+      return Promise.resolve({ enabled: false, managedModelIds });
     }
   }
 

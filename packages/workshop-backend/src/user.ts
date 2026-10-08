@@ -7,7 +7,10 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
-import { getAiGatewayConfig, type AiGatewayConfig } from "./ai-gateway.js";
+import {
+  getAiGatewayConfig, getManagedModels, isManagedModelId, resolveManagedModel,
+  type AiGatewayConfig, type ResolvedAiModelConfig,
+} from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
@@ -95,7 +98,20 @@ export const CLOUDFLARE_VENDOR_ID = "cloudflare";
 
 export type UserAiModelRecord = {
   profile: AiChatAuthorInfo;
-  config: AiModelConfig;
+  config: ResolvedAiModelConfig;
+}
+
+// Runtime protection in addition to RPC validation: spread-based secret retention must not
+// persist backend routing markers (or future transport knobs) supplied by a personal provider.
+function validatePersonalModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): void {
+  if (isManagedModelId(profile.id) || isManagedModelId(config.model) ||
+      Object.keys(profile).some(key => !["type", "id", "name", "commitEmail"].includes(key)) ||
+      Object.keys(config).some(key => ![
+        "provider", "model", "apiToken", "accountId", "apiUrl", "extraHeaders",
+        "contextWindow", "outputLimit",
+      ].includes(key))) {
+    throw new Error("Deployment-managed model identities and routing fields are read-only.");
+  }
 }
 
 const withholdSecret = (secret: string) => secret === "" ? "" : null;
@@ -148,7 +164,7 @@ function resolveWithheldSecrets(
 export type UserChatContext = {
   profile: AiChatAuthorInfo;
   aiModel?: UserAiModelRecord;
-  quickModel?: AiModelConfig;
+  quickModel?: ResolvedAiModelConfig;
 }
 
 type LoginSessionRecord = {
@@ -671,15 +687,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // Also include user-configured models, skipping any that a gateway model shadows, including
     // a hidden one (see #resolveModel()).
     for (let model of this.storage.aiModels.list()) {
-      if (!gwConfig?.resolveModel(model.profile.id)) {
+      if (!isManagedModelId(model.profile.id) && !gwConfig?.resolveModel(model.profile.id)) {
         result.push(model.profile);
       }
     }
+    result.push(...getManagedModels(this.env).map(model => model.profile));
     return result;
   }
 
   async addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
                  copySecretsFrom?: string): Promise<void> {
+    validatePersonalModel(profile, config);
     let source: AiModelConfig | undefined;
     if (copySecretsFrom !== undefined) {
       source = this.#getHandAddedModel(copySecretsFrom).config;
@@ -698,6 +716,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async updateModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): Promise<void> {
+    validatePersonalModel(profile, config);
     let stored = this.#getHandAddedModel(profile.id).config;
     if (config.provider !== stored.provider || config.model !== stored.model) {
       throw new Error("A model's provider and model ID can't be changed.");
@@ -707,6 +726,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** The stored record of a model the user added, throwing for AI Gateway models. */
   #getHandAddedModel(id: string): UserAiModelRecord {
+    if (isManagedModelId(id)) throw new Error("Deployment-managed models are read-only.");
     let record = this.storage.aiModels.get(id);
     // A stored model sharing a gateway model's ID is shadowed by it (see listModels()).
     if (!record || getAiGatewayConfig(this.env)?.resolveModel(id)) {
@@ -716,6 +736,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   #putModel(profile: AiChatAuthorInfo, config: AiModelConfig) {
+    validatePersonalModel(profile, config);
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig && !gwConfig.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
@@ -731,6 +752,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async deleteModel(id: string): Promise<void> {
+    if (isManagedModelId(id)) throw new Error("Deployment-managed models are read-only.");
     // In AI Gateway mode, don't allow deleting built-in suggested models.
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig) {
@@ -745,12 +767,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async setQuickModel(id: string | null): Promise<void> {
+    if (id !== null && !this.#resolveModel(id, getAiGatewayConfig(this.env))) {
+      throw new Error("No such quick model.");
+    }
     this.storage.quickModel.put(id);
   }
 
   async getQuickModel(): Promise<null | string> {
     let result = this.storage.quickModel.get();
-    if (result && this.storage.aiModels.get(result)) {
+    if (result && this.#resolveModel(result, getAiGatewayConfig(this.env))) {
       return result;
     } else {
       return null;
@@ -884,7 +909,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     } else {
       let quickModelId = this.storage.quickModel.get();
       if (quickModelId) {
-        let quickModel = this.storage.aiModels.get(quickModelId);
+        let quickModel = this.#resolveModel(quickModelId, gwConfig);
         if (quickModel) {
           result.quickModel = quickModel.config;
         }
@@ -899,6 +924,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // composer does with its stored choice, and otherwise the first available model.
     let gwConfig = getAiGatewayConfig(this.env);
     let selectedModelId = existingChatModelId;
+    // A removed managed model is unavailable, not consent to use a different paid provider.
+    if (selectedModelId && isManagedModelId(selectedModelId)) {
+      return this.#getChatContext(selectedModelId, gwConfig);
+    }
     if (selectedModelId === null || !this.#resolveModel(selectedModelId, gwConfig)) {
       let models = this.#listModels(gwConfig);
       let preferredModel = this.storage.preferredModel.get();
@@ -913,6 +942,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * model with the same ID.
    */
   #resolveModel(id: string, gwConfig: AiGatewayConfig | null): UserAiModelRecord | undefined {
+    if (isManagedModelId(id)) return resolveManagedModel(this.env, id);
     return gwConfig?.resolveModel(id) ?? this.storage.aiModels.get(id);
   }
 

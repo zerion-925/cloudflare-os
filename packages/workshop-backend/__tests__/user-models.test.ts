@@ -3,6 +3,8 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import type { AiModelConfig } from "@gadgets/workshop-shared/api";
 import type { UserDurableObject } from "../src/user.js";
+import { getModel } from "../src/ai-models.js";
+import { getModelTokenLimits } from "../src/agent-compaction.js";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -113,6 +115,91 @@ describe("UserDurableObject model editing", () => {
     const { user } = await userWithModel();
     const clone = { type: "agent" as const, id: "clone", name: "Clone" };
     await expect(user.addModel(clone, { ...CONFIG, apiToken: null })).rejects.toThrow("required");
+  });
+});
+
+describe("deployment-managed user models", () => {
+  const ID = "managed:cliproxy:gpt-5.5";
+  const CATALOG = [{ model: "gpt-5.5", name: "CLIProxy GPT-5.5" }];
+
+  it("resolves independently for two empty users without storing credentials or enabling quick tasks", async () => {
+    for (const name of ["shared-user-a", "shared-user-b"]) {
+      const stub = env.TEST_USER.getByName(name);
+      await runInDurableObject(stub, async user => {
+        const impl = user as unknown as { env: Cloudflare.Env; storage: {
+          aiModels: { list(): Iterable<unknown> };
+        } };
+        impl.env = { ...impl.env, SHARED_AI_MODELS: CATALOG, CLIPROXY_API_KEY: "synthetic-shared" };
+        const [profile] = await user.listModels();
+        expect(profile).toEqual({ type: "agent", id: ID, name: "CLIProxy GPT-5.5" });
+        expect(await user.getQuickModel()).toBeNull();
+        expect((await user.getChatContext(null)).aiModel).toBeUndefined();
+        expect((await user.getChatContext(ID)).quickModel).toBeUndefined();
+        expect((await user.getExternalMessageChatContext(null)).aiModel?.profile).toEqual(profile);
+        await user.setPreferredModel(ID);
+        await user.setQuickModel(ID);
+        const context = await user.getChatContext(ID);
+        expect(await user.getPreferredModel()).toBe(ID);
+        expect(await user.getQuickModel()).toBe(ID);
+        expect(context.quickModel).toEqual(context.aiModel?.config);
+        expect(getModelTokenLimits(context.aiModel!.config))
+            .toEqual({ inputBudget: 123904, maxOutputTokens: 4096 });
+        expect(JSON.stringify(context)).not.toContain("synthetic-shared");
+        expect([...impl.storage.aiModels.list()]).toEqual([]);
+
+        // Stored selections and facet props survive serialization without a credential.
+        const restored = JSON.parse(JSON.stringify(context.aiModel!.config));
+        expect(getModel(impl.env, restored, context.profile).model.id).toBe("gpt-5.5");
+        impl.env.SHARED_AI_MODELS = [];
+        expect(await user.listModels()).toEqual([]);
+        await expect(user.getChatContext(ID)).rejects.toThrow("No such model");
+        await expect(user.getExternalMessageChatContext(ID)).rejects.toThrow("No such model");
+        expect(() => getModel(impl.env, restored, context.profile)).toThrow("unavailable");
+        expect(await user.getQuickModel()).toBeNull();
+        expect(await user.getPreferredModel()).toBe(ID); // no destructive preference migration
+      });
+    }
+  });
+
+  it("protects read/edit/delete/clone and routing inputs even when the catalog is disabled", async () => {
+    const { user } = await userWithModel();
+    const stub = env.TEST_USER.getByName(`user-models-${userCounter}`);
+    await runInDurableObject(stub, async u => {
+      for (const id of [ID, "managed:unknown:anything"]) {
+        await expect(u.addModel({ ...PROFILE, id }, CONFIG)).rejects.toThrow("read-only");
+        await expect(u.updateModel({ ...PROFILE, id }, CONFIG)).rejects.toThrow("read-only");
+        await expect(u.getModelConfig(id)).rejects.toThrow("read-only");
+        await expect(u.deleteModel(id)).rejects.toThrow("read-only");
+        await expect(u.addModel({ ...PROFILE, id: "clone" }, CONFIG, id)).rejects.toThrow("read-only");
+        await expect(u.setQuickModel(id)).rejects.toThrow("No such");
+      }
+    });
+    for (const fields of [{ managedModelId: ID }, { userGateway: {} }, { headers: {} },
+        { model: ID }, { managedModelId: undefined }]) {
+      const config = { ...CONFIG, ...fields };
+      await expect(user.addModel({ ...PROFILE, id: "forged" }, config)).rejects.toThrow("read-only");
+      await expect(user.updateModel(PROFILE, config)).rejects.toThrow("read-only");
+    }
+    await expect(user.addModel({ ...PROFILE, id: "forged", managedModelId: ID } as typeof PROFILE,
+        CONFIG)).rejects.toThrow("read-only");
+  });
+
+  it("preserves personal same-model identity, order, credentials, and saved preferences", async () => {
+    const stub = env.TEST_USER.getByName(`user-models-${++userCounter}`);
+    await runInDurableObject(stub, async user => {
+      const impl = user as unknown as { env: Cloudflare.Env };
+      const personal = { ...PROFILE, id: "gpt-5.5" };
+      await user.addModel(personal, { ...CONFIG, model: "gpt-5.5" });
+      await user.setPreferredModel(personal.id);
+      impl.env = { ...impl.env, SHARED_AI_MODELS: CATALOG };
+      expect((await user.listModels()).map(model => model.id)).toEqual([personal.id, ID]);
+      expect((await user.getExternalMessageChatContext(null)).aiModel?.profile.id).toBe(personal.id);
+      expect((await user.getChatContext(personal.id)).aiModel?.config.apiToken).toBe(CONFIG.apiToken);
+      await expect(user.getModelConfig(ID)).rejects.toThrow("read-only");
+      await user.updateModel(personal, { ...CONFIG, model: "gpt-5.5", apiToken: "replaced" });
+      await user.deleteModel(personal.id);
+      expect((await user.listModels()).map(model => model.id)).toEqual([ID]);
+    });
   });
 });
 
