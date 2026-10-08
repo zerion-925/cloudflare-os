@@ -962,14 +962,16 @@ export class WorkspaceGitCache {
   // reaches no proven one, and throws for such a chain with no claimed commit.
   #walkPushAncestry(gatekeeperId: WorkpieceId, heads: GitOid[]): GitOid[] {
     let claimed = new Set<GitOid>();
-    let visited = new Set<GitOid>();
+    // Per commit and claim: chains meeting below different claims each need their own proven.
+    let visited = new Set<string>();
     let stack: { oid: GitOid, claim?: GitOid }[] =
         heads.map(oid => ({ oid: validateGitOid(oid) }));
     let provenElsewhere: GitOid | undefined;  // the nearest commit another connection proved
     while (stack.length > 0) {
       let { oid, claim } = stack.pop()!;
-      if (visited.has(oid)) continue;
-      visited.add(oid);
+      let key = `${oid}:${claim ?? ""}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
       let meta = this.storage.gitObjectMetadata.get(oid);
       if (meta?.onRemote.includes(gatekeeperId)) {
         // Prefer the decoded local type over the recorded one: an onRemote row's type is
