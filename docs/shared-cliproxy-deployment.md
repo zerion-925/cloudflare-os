@@ -1,11 +1,11 @@
 # Deploy the shared CLIProxy patch
 
-This is source publication, **not a deployed instance**. The native local application previously passed two-user shared selection, streamed text and harmless tool-result continuation. Browser UI, real Cloudflare Access and production routing remain unproven. No inference, deployment or secret installation was performed for publication.
+This is synchronized source publication, **not a deployed instance**. Native local two-user selection, streamed text and harmless tool continuation passed on the earlier publication, not on this new upstream snapshot. This revision has fresh synthetic shared-provider/Gateway compatibility checks; no new live inference, deployment or secret installation was performed. Browser UI, real Cloudflare Access and production routing remain unproven.
 
 ## 1. Reproduce the exact sources
 
 - Publication: [zerion-925/cloudflare-os, `fm/cfos-fork-publish`](https://github.com/zerion-925/cloudflare-os/tree/fm/cfos-fork-publish), not either repository's default branch.
-- Official OS base: [`1045d2e1ceac7be29e1a6f056c936fb31aa00851`](https://github.com/cloudflare/cloudflare-os/commit/1045d2e1ceac7be29e1a6f056c936fb31aa00851).
+- Captured official OS tip merged into this revision: [`27d20adf26e8636d2b279ec79882f441742e08d5`](https://github.com/cloudflare/cloudflare-os/commit/27d20adf26e8636d2b279ec79882f441742e08d5).
 - Official starter base: [`3d211477ad009e13a98d863d843e5c12a29ad02b`](https://github.com/cloudflare/cloudflare-os-starter/commit/3d211477ad009e13a98d863d843e5c12a29ad02b).
 
 Use the **full published commit from this guide's immutable `/blob/<SHA>/...` URL** for `OS_COMMIT` below. The guide and companion must come from that same revision. A branch name alone is not an immutable pin; do not substitute current upstream `main`.
@@ -41,7 +41,9 @@ The companion includes all required prepared starter changes:
 | Both starter `packages/*/vite.config.ts` files | Existing task cache settings must use Vite+ 1's `cache` nesting |
 | `pnpm-workspace.yaml`, `packages/error-reporter/package.json`, `pnpm-lock.yaml` | Selected OS catalog/manifest/locked dependency alignment, including the existing OS scripts workspace; not new shared-provider logic |
 
-Application/test sources are the previously validated checkpoint, unchanged. Starter documentation inside the patch describes the earlier local-patch stage; the publication/pinning and validation status in **this guide** supersede those historical statements. Licenses and upstream attribution are unchanged.
+This revision merges the captured upstream tip while retaining the shared-provider feature. Compatibility resolutions adapt the moved User storage type, upstream admin Gateway models/reasoning, and public provider metadata without changing the fixed shared transport. The companion mirrors the new upstream toolchain catalog and includes its frozen starter lockfile. It still applies only to the declared starter base; the separate starter repository is not synchronized.
+
+Historical provenance remains immutable: [original publication `e0477e70fe28ea97e81c61d5296c21e172cdd33b`](https://github.com/zerion-925/cloudflare-os/commit/e0477e70fe28ea97e81c61d5296c21e172cdd33b), [original guide](https://github.com/zerion-925/cloudflare-os/blob/e0477e70fe28ea97e81c61d5296c21e172cdd33b/docs/shared-cliproxy-deployment.md), [original companion](https://github.com/zerion-925/cloudflare-os/blob/e0477e70fe28ea97e81c61d5296c21e172cdd33b/docs/shared-cliproxy-starter.patch), and [original official OS base `1045d2e1ceac7be29e1a6f056c936fb31aa00851`](https://github.com/cloudflare/cloudflare-os/commit/1045d2e1ceac7be29e1a6f056c936fb31aa00851). Use the matching current guide/companion, not those historical materials, to reproduce this revision. Licenses and upstream attribution are unchanged.
 
 ## 2. Prerequisites and private configuration
 
@@ -59,7 +61,7 @@ pnpm exec wrangler whoami
 # pnpm exec wrangler login
 ```
 
-Frozen versions are starter Wrangler **4.145.0** and OS Wrangler **4.138.0**. Do not upgrade dependencies to reproduce this checkpoint. Authentication success is not proof of billing/runtime readiness.
+Frozen versions are starter Wrangler **4.147.0** and OS Wrangler **4.147.0**. Do not upgrade dependencies to reproduce this revision. Authentication success is not proof of billing/runtime readiness.
 
 Before any deployment, approve and confirm:
 
@@ -156,7 +158,7 @@ The script creates temporary `wrangler.prod.jsonc` files from the pinned bases a
 
 ## 5. Future acceptance and rollback
 
-Existing local mocked regressions and native local text/tool/two-user acceptance are reused, not rerun for this publication. For a separately authorized rollout:
+Fresh synthetic backend/model/user and frontend provider/composer regressions cover this merged revision, including coexistence with upstream Gateway admin controls. The starter companion's applicability and deployment-generation unit checks are also rerun. Earlier native live text/tool/two-user acceptance belongs only to the original publication; it does not validate this merged revision against the real provider. No full configured preflight, deployed/browser/Access acceptance or live inference is claimed. For a separately authorized rollout:
 
 1. Local: run the existing focused backend/model/user and frontend provider/composer regressions with synthetic keys. For an authorized live check, keep calls bounded to short text and one harmless calculation; do not copy synthetic fixtures into production secrets.
 2. Deployed: use two distinct allowed Access users with no personal AI key. Both must see/select the managed entry, get streamed text, and complete one harmless `6 * 7` tool-result continuation. Keep quick usage off unless explicitly testing opt-in. Confirm personal coexistence and No-agent behavior.
