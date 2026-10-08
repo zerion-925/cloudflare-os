@@ -1,3 +1,5 @@
+import type { RpcStub } from "cloudflare:workers";
+
 /** Forward-only paginated results. Call `next()` until it returns `null`; dispose the cursor when
  *  finished, including when stopping early. */
 export interface Cursor<T> {
@@ -21,8 +23,17 @@ export type EmailAddress = {
 export type EmailRecipient = string;
 
 /**
- * A stable RFC 5322 Message-ID reserved for an outgoing message.
- * Once the message has been sent, this value can be passed to {@link GmailScopedSession.getMessage}.
+ * A stable RFC 5322 Message-ID reserved for an outgoing message. Pass it to
+ * {@link GmailScopedSession.getMessage} to open the message, which works as soon as the method
+ * that sent it returns.
+ *
+ * A message you have just sent may not have been delivered yet. Until it has been:
+ * - It can be read, but not changed: its labels cannot be modified, and it cannot be replied to
+ *   or forwarded. Those methods throw.
+ * - A reply already appears in its thread. New mail and forwards have no thread yet, so their
+ *   {@link GmailMessage.thread} throws.
+ * - Its {@link GmailMessageInfo.id} is this value. Keep using it: it continues to identify the
+ *   message after delivery.
  */
 export type GmailMessageId = string;
 
@@ -54,9 +65,16 @@ export type GmailThreadInfo = {
 
 /** Metadata describing a Gmail message. */
 export type GmailMessageInfo = {
-  /** Gmail's stable identifier for the message. */
+  /**
+   * Gmail's stable identifier for the message. A message you have just sent has its
+   * {@link GmailMessageId} here until Gmail assigns its own identifier.
+   * {@link GmailScopedSession.getMessage} accepts both.
+   */
   id: string;
-  /** Gmail's stable identifier for the containing thread. */
+  /**
+   * Gmail's stable identifier for the containing thread. Absent for new mail or a forward you
+   * have just sent, until Gmail assigns its thread.
+   */
   threadId?: string;
   /** The sender. */
   from: EmailAddress;
@@ -212,6 +230,18 @@ export type GmailMessageEntry = {
   message: GmailMessage;
 }
 
+/** Implemented by a gadget to receive new mail; see `GmailScopedSession.subscribeNewMessages()`. */
+export interface GmailMessageHook {
+  /**
+   * Called with each new message. `entry.message` can read it in full, reply and change it;
+   * writes are queued for approval, and it is released when this call returns (call
+   * `entry.message.thread()` for the rest of the thread). Delivery is at least once and
+   * unordered, and a message this throws for is retried with backoff, eight attempts in all, so
+   * key any work on `entry.info.id` to keep it idempotent. Disabling the hook ends its retries.
+   */
+  receiveMessage(entry: GmailMessageEntry): Promise<void>;
+}
+
 /** A draft cursor entry containing metadata and a draft capability. */
 export type GmailDraftEntry = {
   /** Metadata for this result. */
@@ -244,6 +274,10 @@ export interface GmailScopedSession {
    * Search for threads with Gmail's native query syntax. Useful operators
    * include `from:`, `to:`, `after:`, `before:`, `is:unread`, and `label:`.
    * Any search or label restriction on the binding is also applied.
+   *
+   * Note that search results may not reflect label changes you have made
+   * recently, since such changes are sometimes held for approval and this
+   * search function is currently unable to simulate pending labels.
    */
   searchThreads(query: string): Promise<Cursor<GmailThreadEntry>>;
 
@@ -259,9 +293,13 @@ export interface GmailScopedSession {
 
   /**
    * Search for individual messages with Gmail's native query syntax. Any
-   * search or label restriction on the binding is also applied. Gmail may
-   * briefly omit newly-sent mail from search results; retry a query such as
-   * `in:sent ...` instead of treating the first empty result as a send failure.
+   * search or label restriction on the binding is also applied. Mail you have
+   * just sent may not appear in search results; open it with
+   * {@link getMessage} and the identifier its send returned instead.
+   *
+   * Note that search results may not reflect label changes you have made
+   * recently, since such changes are sometimes held for approval and this
+   * search function is currently unable to simulate pending labels.
    */
   searchMessages(query: string): Promise<Cursor<GmailMessageEntry>>;
 
@@ -292,6 +330,44 @@ export interface GmailScopedSession {
    * by this binding. Pending updates are reflected by the returned capability.
    */
   getDraft(id: string): Promise<GmailDraft>;
+
+  /**
+   * Have `hook.receiveMessage()` called with each new message this binding's `listMessages()`
+   * would list: mail arriving in the inbox for a whole-mailbox binding, or arriving with the label
+   * for a label binding. Mail the connected account sends, drafts, spam and trash are never
+   * delivered. The hook starts disabled, and nothing is delivered until the user enables it.
+   * Every call creates a distinct hook, so subscribe once per mailbox or thread to watch.
+   *
+   * `hook` must be a persistent stub: from `executeCode`, create it with
+   * `env.MY_GADGET[restore](params)` on the Gadget's binding; inside the Gadget, with
+   * `this.ctx.restore(params)`. The Gadget's `[restore]()` receives those `params` for every
+   * delivery, so they can tell its subscriptions apart. The restored target is a separate
+   * object; pass it what it needs from `[restore]()`, such as `this`, the Gadget.
+   *
+   * Throws for a search binding, and if this deployment has not configured Gmail hooks.
+   *
+   * @example
+   * // server.js
+   * import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
+   * export class Gadget extends DurableObject {
+   *   async [restore](params) {
+   *     if (params.type === "gmail") return new Triage();
+   *     throw new TypeError(`Unknown restore type: ${params.type}`);
+   *   }
+   * }
+   * class Triage extends RpcTarget {
+   *   async receiveMessage({ info, message }) {
+   *     if (/urgent/i.test(info.subject)) await message.star();
+   *   }
+   * }
+   *
+   * // executeCode
+   * import { restore } from "cloudflare:workers";
+   * export default async function(self, env) {
+   *   await env.GMAIL_INBOX.subscribeNewMessages(await env.MY_GADGET[restore]({ type: "gmail" }));
+   * }
+   */
+  subscribeNewMessages(hook: RpcStub<GmailMessageHook>): Promise<void>;
 }
 
 /** Full-mailbox Gmail access, including composing messages and managing labels. */
@@ -300,7 +376,7 @@ export interface GmailSession extends GmailScopedSession {
    * Compose and send a new email. `body` is the plain-text representation;
    * `options.html`, when provided, is sent as its HTML alternative. At least
    * one To, CC, or BCC recipient is required. Returns an identifier that can
-   * be passed to {@link GmailScopedSession.getMessage} once the message has been sent.
+   * be passed to {@link GmailScopedSession.getMessage}.
    */
   send(
     to: EmailRecipient[],
@@ -399,6 +475,13 @@ export interface GmailThread {
    * the equivalent built-in label.
    */
   removeLabel(label: GmailMutableLabel, lastMessageId?: string): Promise<void>;
+
+  /**
+   * As {@link GmailScopedSession.subscribeNewMessages}, for new messages in this thread, whether
+   * or not they reach the inbox; on a label binding, only those carrying the label. Throws for a
+   * search binding.
+   */
+  subscribeNewMessages(hook: RpcStub<GmailMessageHook>): Promise<void>;
 }
 
 /** Access to one Gmail message admitted by the binding's scope. */
@@ -429,7 +512,7 @@ export interface GmailMessage {
    * connected mailbox, it uses the first original To recipient. Calculated
    * lists remove the connected mailbox, omit original BCC recipients, and
    * remove duplicates. Returns an identifier that can be passed to
-   * {@link GmailScopedSession.getMessage} once the reply has been sent.
+   * {@link GmailScopedSession.getMessage}.
    */
   reply(body: string, options?: GmailReplyOptions): Promise<GmailMessageId>;
 
@@ -437,8 +520,7 @@ export interface GmailMessage {
    * Reply to the sender plus the original To and CC recipients. Supplying any
    * recipient option replaces that complete calculated set. The connected
    * mailbox and duplicates are removed from calculated recipients. Returns an
-   * identifier that can be passed to {@link GmailScopedSession.getMessage}
-   * once the reply has been sent.
+   * identifier that can be passed to {@link GmailScopedSession.getMessage}.
    */
   replyAll(body: string, options?: GmailReplyOptions): Promise<GmailMessageId>;
 
@@ -448,7 +530,7 @@ export interface GmailMessage {
    * preface and `options.html`, when provided, is its HTML alternative. The
    * original attachments are included as regular attachments. At least one
    * To, CC, or BCC recipient is required. Returns an identifier that can be
-   * passed to {@link GmailScopedSession.getMessage} once the forward has been sent.
+   * passed to {@link GmailScopedSession.getMessage}.
    */
   forward(
     to: EmailRecipient[],
@@ -532,7 +614,7 @@ export interface GmailDraft {
    * Send the draft, preserving its thread placement when it is a reply.
    * Sending requires at least one recipient. New drafts require a plain-text body;
    * reply drafts may have an empty body. Returns an identifier that can be passed
-   * to {@link GmailScopedSession.getMessage} once the draft has been sent.
+   * to {@link GmailScopedSession.getMessage}.
    */
   send(): Promise<GmailMessageId>;
 }

@@ -109,11 +109,11 @@ The check works as follows:
 | `containsRestrictedData` enforcement | `overseer.ts` (`authorizeObservation` sets `containsRestrictedData`; `getWebFetchEnv`, `submitAction`) |
 | `ownerInvitesOnly` enforcement | `overseer.ts` (`authorizeObservation` sets `ownerInvitesOnly` and restarts the workspace if anyone lost access); `sharing.ts` (`computeEffectiveRoles` counts only direct owner grants; the `ownerInvitesOnly` hook in `redeemShareKey`, `addCollaborator`, `createShareLink`, `newShareLinkKey`) |
 | Observation recording | `overseer.ts` `authorizeObservation()`; `ApprovalQueueImpl` |
-| Gatekeeper storage record | `overseer.ts` `GatekeeperRecord` (has `creationSpec.vendorId`) |
+| Gatekeeper storage record | `overseer-storage.ts` `GatekeeperRecord` (has `creationSpec.vendorId`) |
 | `GatekeeperCreationSpec` | `packages/workshop-shared/src/api.ts` |
 | Gatekeeper facet access | `overseer.ts` `getGatekeeperFacet()` |
-| Overseer storage collections | `overseer.ts` (`gatekeepers`, with `byBindingName` index — template for a new collection) |
-| Connected accounts (User DO) | `packages/workshop-backend/src/user.ts` `ConnectedAccountRecord` (`account: Fetcher<GatekeeperUser>`, `vendorId`) |
+| Overseer storage collections | `overseer-storage.ts` (`gatekeepers`, with `byBindingName` index — template for a new collection) |
+| Connected accounts (User DO) | `packages/workshop-backend/src/storage-schema/user-storage.ts` `ConnectedAccountRecord` (`account: Fetcher<GatekeeperUser>`, `vendorId`) |
 | List connected accounts | `user.ts` `subscribeConnectedAccounts()`; subscriber type in `api.ts` |
 | Account → gatekeeper class | `user.ts` `getGatekeeperClassFor()` |
 
@@ -149,7 +149,7 @@ The check works as follows:
 ### New overseer storage collection: `observers`
 
 Add an `observers` collection to `OverseerStorage` (mirror the `gatekeepers` collection in
-`overseer.ts`, including a secondary index for reverse lookup):
+`overseer-storage.ts`, including a secondary index for reverse lookup):
 
 ```ts
 type ObserverRecord = {
@@ -828,6 +828,7 @@ its resource types.
 | **github** | Repo / Issue / PR | **B** | Check the observer's GitHub identity has read access to the bound repo (public → always pass; private → collaborator/org-team check). Issues/PRs inherit the repo ACL, so the repo is the atomic unit. |
 | **google** | Google Doc | **B** | Check the observer's Drive sharing access to the bound document. |
 | **google** | Google Spreadsheet | **B** | Check the observer's Google Sheets access to the bound spreadsheet. Spreadsheet sharing applies to the whole file, so it is the atomic unit. |
+| **google** | Google Slides Presentation | **B** | Check the observer's Google Slides access to the bound presentation. Presentation sharing applies to the whole file, so it is the atomic unit. |
 | **google** | Google Calendar (selected calendar) | **B** | Require `writer` or `owner` access to the bound calendar, since `reader` access hides private-event details. Future: let the binding owner exclude private events so readers can collaborate. |
 | **google** | Google Calendar (`allVisible` availability) | **C** | In addition to the selected-calendar check, track foreign calendars whose free/busy data was successfully read and verify each observer can independently query their availability. |
 | **google** | Gmail Mailbox | **A** | Always throw. (Future: allow observers who independently have access, e.g. mailing-list members — explicitly out of scope now.) |

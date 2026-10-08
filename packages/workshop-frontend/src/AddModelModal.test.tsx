@@ -84,13 +84,16 @@ describe('AddModelModal with a stored model', () => {
     return { updateModel, addModel }
   }
 
-  it('offers managed selection without editor, clone, delete or credential loading', async () => {
+  it.each([false, true])('offers managed selection without mutation when Gateway is %s', async (gateway) => {
     const managed = { type: 'agent' as const, id: 'managed:cliproxy:gpt-5.5', name: 'CLIProxy GPT-5.5' }
     const getModelConfig = vi.fn<AuthenticatedApi['getModelConfig']>()
     const setQuickModel = vi.fn<AuthenticatedApi['setQuickModel']>(async () => {})
     providerState.api = {
       listModels: async () => [managed], getQuickModel: async () => null,
-      getAiConfig: async () => ({ enabled: false, managedModelIds: [managed.id] }),
+      getAiConfig: async () => gateway
+        ? { enabled: true, enabledProviders: ['openai'], builtInModelIds: [],
+            userModelsEnabled: false, managedModelIds: [managed.id] }
+        : { enabled: false, managedModelIds: [managed.id] },
       getModelConfig, setQuickModel,
     }
     const container = document.createElement('div')
@@ -100,8 +103,9 @@ describe('AddModelModal with a stored model', () => {
     await ProvidersPage.preload?.()
     await act(async () => root!.render(<ProvidersPage />))
     expect(document.body.textContent).toContain('Deployment-managed')
-    expect(document.body.textContent).not.toContain('AI Gateway mode:')
-    expect(document.body.textContent).toContain('none set.')
+    expect(document.body.textContent?.includes('AI Gateway mode:')).toBe(gateway)
+    expect(document.body.textContent?.includes('Add provider')).toBe(!gateway)
+    expect(document.body.textContent?.includes('none set.')).toBe(!gateway)
     expect(setQuickModel).not.toHaveBeenCalled()
     const row = container.querySelector<HTMLElement>('[role="button"]')!
     await click(row)

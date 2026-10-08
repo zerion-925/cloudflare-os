@@ -28,6 +28,7 @@ describe("resource declarations", () => {
       "https://mail.google.com/*",
       "https://docs.google.com/document/d/:docId/*",
       "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
+      "https://docs.google.com/presentation/d/:presentationId/*",
       "https://calendar.google.com/calendar/:calendarId/*",
       "https://drive.google.com/drive/my-drive",
       "https://drive.google.com/drive/folders/:folderId",
@@ -110,16 +111,21 @@ describe("resource declarations", () => {
   // `chat.app.*` family would make it post as a configured Chat app instead of as the person,
   // `chat.admin.*` would reach conversations the connected user cannot open, and `chat.import`
   // and `chat.delete` are destructive surfaces the session never exposes. Memberships are
-  // read-only because the session offers no way to change them.
-  it("requests only user-authentication Chat scopes, with read state for the account alone", () => {
+  // read-only because the session offers no way to change them, and the account may create
+  // conversations but not reconfigure them, so it never holds the full `chat.spaces`.
+  it("requests only user-authentication Chat scopes, with account-only extras", () => {
     const conversation = [
       "https://www.googleapis.com/auth/chat.spaces.readonly",
       "https://www.googleapis.com/auth/chat.messages",
       "https://www.googleapis.com/auth/chat.memberships.readonly",
     ];
-    const readState = "https://www.googleapis.com/auth/chat.users.readstate.readonly";
+    const accountOnly = [
+      "https://www.googleapis.com/auth/chat.users.readstate.readonly",
+      "https://www.googleapis.com/auth/chat.spaces.create",
+      "https://www.googleapis.com/auth/directory.readonly",
+    ];
     for (const [resource, expected] of [
-      [GOOGLE_CHAT_RESOURCE, [...conversation, readState]],
+      [GOOGLE_CHAT_RESOURCE, [...conversation, ...accountOnly]],
       [GOOGLE_CHAT_SPACE_RESOURCE, conversation],
       [GOOGLE_CHAT_THREAD_RESOURCE, conversation],
     ] as const) {
@@ -336,8 +342,8 @@ describe("parseResourceUrl", () => {
       expect(() => parseResourceUrl(url)).toThrow(/Unsupported Google/);
     });
 
-    it("rejects a docs.google.com path that is neither a doc nor a sheet", () => {
-      expect(() => parseResourceUrl("https://docs.google.com/presentation/d/abc/edit"))
+    it("rejects a docs.google.com path that is not a doc, sheet or presentation", () => {
+      expect(() => parseResourceUrl("https://docs.google.com/forms/d/abc/edit"))
         .toThrow(/Unsupported Google Docs resource URL/);
     });
 
@@ -360,9 +366,9 @@ describe("parseResourceUrl", () => {
 
       it("omits the fragment, which for Gmail is a search query", () => {
         let message = messageFor(
-          "https://docs.google.com/presentation/d/abc/edit#search/acquisition+target");
+          "https://docs.google.com/forms/d/abc/edit#search/acquisition+target");
         expect(message).not.toContain("acquisition");
-        expect(message).toContain("docs.google.com/presentation/d/abc/edit");
+        expect(message).toContain("docs.google.com/forms/d/abc/edit");
       });
 
       it("omits query parameters", () => {
@@ -371,7 +377,7 @@ describe("parseResourceUrl", () => {
       });
 
       it("omits credentials embedded in the authority", () => {
-        let message = messageFor("https://user:hunter2@docs.google.com/presentation/d/abc");
+        let message = messageFor("https://user:hunter2@docs.google.com/forms/d/abc");
         expect(message).not.toContain("hunter2");
         expect(message).not.toContain("user");
       });
@@ -437,7 +443,7 @@ describe("parseResourceUrl", () => {
     });
   });
 
-  describe("docs and sheets", () => {
+  describe("docs, sheets and slides", () => {
     it("extracts a document ID, ignoring trailing path", () => {
       expect(parseResourceUrl("https://docs.google.com/document/d/DOC123/edit?usp=sharing"))
         .toEqual({ kind: "doc", documentId: "DOC123" });
@@ -448,9 +454,15 @@ describe("parseResourceUrl", () => {
         .toEqual({ kind: "sheets", spreadsheetId: "SHEET123" });
     });
 
+    it("extracts a presentation ID", () => {
+      expect(parseResourceUrl("https://docs.google.com/presentation/d/DECK123/edit#slide=id.p"))
+        .toEqual({ kind: "slides", presentationId: "DECK123" });
+    });
+
     it.each([
       ["document", "https://docs.google.com/document/d/"],
       ["spreadsheet", "https://docs.google.com/spreadsheets/d/"],
+      ["presentation", "https://docs.google.com/presentation/d/"],
     ])("rejects a %s URL with no ID", (_name, url) => {
       expect(() => parseResourceUrl(url)).toThrow(/no .* ID found/);
     });

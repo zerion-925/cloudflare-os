@@ -49,6 +49,20 @@ export const GOOGLE_SHEETS_RESOURCE: SupportedResource = {
   grantable: true,
 };
 
+/**
+ * A single Google Slides presentation.
+ *
+ * Requests the read-write `presentations` scope although reads are all it offers yet: edits are
+ * planned for this same resource, and growing its scopes later would retract every existing grant
+ * (see {@link grantedResourceUrlPatterns}) until each account reconnected.
+ */
+export const GOOGLE_SLIDES_RESOURCE: SupportedResource = {
+  urlPattern: "https://docs.google.com/presentation/d/:presentationId/*",
+  title: "Google Slides Presentation",
+  description: "Read the slides, text, and speaker notes of a presentation you choose.",
+  grantable: true,
+};
+
 /** A single Google Calendar. */
 export const GOOGLE_CALENDAR_RESOURCE: SupportedResource = {
   urlPattern: "https://calendar.google.com/calendar/:calendarId/*",
@@ -73,8 +87,9 @@ export const GOOGLE_CHAT_RESOURCE: SupportedResource = {
   title: "Google Chat Account",
   description:
       "Find conversations, read and search messages across them, and post, react, or edit as " +
-      "you. Covers direct messages as well as spaces, so it cannot be shared with " +
-      "collaborators — connect a single conversation for that.",
+      "you. Can also look people up in your organization's directory and start direct messages " +
+      "or group chats with them. Covers direct messages as well as spaces, so it cannot be " +
+      "shared with collaborators — connect a single conversation for that.",
   grantable: true,
 };
 
@@ -177,7 +192,9 @@ export const SCOPE_DERIVED_RESOURCE_URL_PATTERNS = [
  * `chat.messages` rather than the narrower `chat.messages.readonly` plus `chat.messages.create`
  * because the binding also edits messages and can undo its own sends, which need the combined
  * scope; it covers reactions too. Only the account resource adds `chat.users.readstate.readonly`,
- * for its `unreadOnly` search filter.
+ * for its `unreadOnly` search filter, and what starting a conversation needs: `chat.spaces.create`
+ * (not `chat.spaces`, which could also rename and reconfigure conversations) and
+ * `directory.readonly`, to find people and to confirm they belong to the organization.
  */
 const CHAT_SCOPES = [
   "https://www.googleapis.com/auth/chat.spaces.readonly",
@@ -207,6 +224,14 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
     scopes: [
       "https://www.googleapis.com/auth/spreadsheets.readonly",
       // Read-only Drive file metadata, used to power the spreadsheet picker.
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ],
+  },
+  {
+    resource: GOOGLE_SLIDES_RESOURCE,
+    scopes: [
+      "https://www.googleapis.com/auth/presentations",
+      // Read-only Drive file metadata, used to power the presentation picker.
       "https://www.googleapis.com/auth/drive.metadata.readonly",
     ],
   },
@@ -249,7 +274,12 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
   // and `chat.delete` are all deliberately absent.
   {
     resource: GOOGLE_CHAT_RESOURCE,
-    scopes: [...CHAT_SCOPES, "https://www.googleapis.com/auth/chat.users.readstate.readonly"],
+    scopes: [
+      ...CHAT_SCOPES,
+      "https://www.googleapis.com/auth/chat.users.readstate.readonly",
+      "https://www.googleapis.com/auth/chat.spaces.create",
+      "https://www.googleapis.com/auth/directory.readonly",
+    ],
   },
   {
     resource: GOOGLE_CHAT_SPACE_RESOURCE,
@@ -330,6 +360,9 @@ const SCOPE_COVERED_BY: Record<string, readonly string[]> = {
     "https://www.googleapis.com/auth/spreadsheets", DRIVE_READONLY_SCOPE, DRIVE_READWRITE_SCOPE,
   ],
   "https://www.googleapis.com/auth/chat.spaces.readonly": [
+    "https://www.googleapis.com/auth/chat.spaces",
+  ],
+  "https://www.googleapis.com/auth/chat.spaces.create": [
     "https://www.googleapis.com/auth/chat.spaces",
   ],
   "https://www.googleapis.com/auth/chat.memberships.readonly": [
@@ -418,6 +451,7 @@ export type ResourceTarget =
   | { kind: "gmail"; searchQuery?: string; labelName?: string }
   | { kind: "doc"; documentId: string }
   | { kind: "sheets"; spreadsheetId: string }
+  | { kind: "slides"; presentationId: string }
   | { kind: "calendar"; calendarId: string; availabilityMode: CalendarAvailabilityMode }
   | { kind: "bigquery"; projectId: string; datasetId?: string; tableId?: string }
   | { kind: "driveAccount" }
@@ -432,6 +466,7 @@ export const RESOURCE_BY_KIND: Record<ResourceTarget["kind"], SupportedResource>
   gmail: GMAIL_RESOURCE,
   doc: GOOGLE_DOC_RESOURCE,
   sheets: GOOGLE_SHEETS_RESOURCE,
+  slides: GOOGLE_SLIDES_RESOURCE,
   calendar: GOOGLE_CALENDAR_RESOURCE,
   bigquery: BIGQUERY_RESOURCE,
   driveAccount: GOOGLE_DRIVE_RESOURCE,
@@ -513,7 +548,7 @@ function parseGmailUrl(parsed: URL): ResourceTarget {
 }
 
 function parseDocsUrl(parsed: URL): ResourceTarget {
-  // Both forms are /<type>/d/<id>/..., so the id is always the third segment.
+  // Every form is /<type>/d/<id>/..., so the id is always the third segment.
   let id = parsed.pathname.split("/")[3];
   if (parsed.pathname.startsWith("/document/d/")) {
     if (!id) throw new Error("Invalid Google Docs URL: no document ID found");
@@ -522,6 +557,10 @@ function parseDocsUrl(parsed: URL): ResourceTarget {
   if (parsed.pathname.startsWith("/spreadsheets/d/")) {
     if (!id) throw new Error("Invalid Google Sheets URL: no spreadsheet ID found");
     return { kind: "sheets", spreadsheetId: id };
+  }
+  if (parsed.pathname.startsWith("/presentation/d/")) {
+    if (!id) throw new Error("Invalid Google Slides URL: no presentation ID found");
+    return { kind: "slides", presentationId: id };
   }
   throw new Error(`Unsupported Google Docs resource URL: ${describeUrl(parsed)}`);
 }
